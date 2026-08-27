@@ -1,138 +1,122 @@
 <p align="center">
-  <h1 align="center">dflash-mlx</h1>
-  <p align="center">DFlash speculative decoding for Apple Silicon</p>
+  <h1 align="center">dflash-mlx-autoresearch</h1>
+  <p align="center">DFlash speculative decoding for Apple Silicon,<br>tuned for coding-agent workloads: prefix caching, cache-key normalization, and a DSpark drafter port</p>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
   <img src="https://img.shields.io/badge/python-3.10%2B-blue?logo=python" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
-  <img src="https://img.shields.io/badge/MLX-stock-red" alt="Stock MLX">
 </p>
 
-Paper: [DFlash: Block Diffusion for Flash Speculative Decoding](https://arxiv.org/abs/2602.06036) (Chen et al., 2026)
+A fork of [bstnxbt/dflash-mlx](https://github.com/bstnxbt/dflash-mlx) (v0.1.3) focused on one question: **can a local model on a Mac actually drive a coding agent?**
 
-Block-diffusion draft generates 16 tokens in one pass. Target verifies in one pass. Output is lossless — every emitted token is verified against the target model before it is committed.
+Speculative decoding solves decode speed. What it doesn't solve is that agent harnesses resend an ever-growing conversation prefix every turn — and at agent scale (20k–30k token prompts), prefill dominates. This fork adds a prefix cache designed around how agent frameworks actually construct prompts, plus support for the RadixArk DSpark drafter family.
 
-https://github.com/user-attachments/assets/a9be2b48-3264-4970-b836-c876b0b7fdda
- 
-## How it works
+**Headline numbers** (M5 Max, 128 GB / 614 GB/s):
 
-- A small draft model (~1B params) generates 16 tokens in parallel with block diffusion.
-- The target model verifies those 16 tokens in a single forward pass.
-- Greedy acceptance keeps the correct prefix and rejects the rest.
-- Lossless: every emitted token is the target model's greedy argmax at verification time. Output can still differ from pure AR because of MLX dispatch divergence, but no unverified token is ever emitted.
-- Uses stock MLX plus a small number of targeted kernels where rollback and long-context verify need tighter numerical control.
+| Metric | Before | After |
+|---|---|---|
+| Warm-turn prefill, 27k-token agent prompt | ~85 s | **1.5 s** |
+| Decode, Qwen3.5-35B-A3B (8-bit MLX) | 114.2 tok/s cold | **118.4 tok/s warm** |
+| Correctness (warm vs. cold output) | — | **bit-identical** |
 
-## Technical details
+## Why the stock prompt cache wasn't enough
 
-- **Tape-replay rollback**: instead of snapshotting and restoring the full GatedDeltaNet state, dflash-mlx records an innovation tape during verify and replays only the accepted steps through a custom Metal kernel. Keeps rollback cost low and preserves acceptance over long generations.
-- **JIT SDPA 2-pass**: long-context verify (`N >= 1024`) uses a custom Metal attention kernel that stays numerically aligned with stock MLX attention.
-- **Numerical coherence**: bf16-sensitive paths, including recurrent state replay and small projections, are stabilized across speculative cycles so accepted tokens stay consistent.
+The journey here is five root causes deep, each found by instrumenting real agent sessions (opencode, pi) against the server:
 
-## Benchmarks
+1. **The hybrid-cache trim bug.** `mlx_lm`'s prompt cache silently never hits for hybrid-attention targets (Qwen3.5's GatedDeltaNet + attention mix): `can_trim_prompt_cache` returns `False` for mixed `ArraysCache` + `KVCache`, so every turn was a full re-prefill with no error or warning.
 
-| Model | Tokens | Baseline | DFlash | Speedup | Acceptance |
-|-------|--------|----------|--------|---------|------------|
-| Qwen3.5-4B | 1024 | 53.48 tok/s | 197.49 tok/s | 3.69x | 88.67% |
-| Qwen3.5-4B | 2048 | 53.74 tok/s | 219.83 tok/s | 4.10x | 89.26% |
-| Qwen3.5-4B | 4096 | 53.58 tok/s | 155.19 tok/s | 2.83x | 87.55% |
-| Qwen3.5-9B | 1024 | 31.09 tok/s | 127.47 tok/s | 4.10x | 88.96% |
-| Qwen3.5-9B | 2048 | 30.96 tok/s | 127.07 tok/s | 4.13x | 89.36% |
-| Qwen3.5-9B | 4096 | 31.58 tok/s | 103.90 tok/s | 3.29x | 88.57% |
-| Qwen3.5-27B-4bit | 1024 | 33.24 tok/s | 65.80 tok/s | 1.98x | 89.45% |
-| Qwen3.5-27B-4bit | 2048 | 32.35 tok/s | 62.78 tok/s | 1.90x | 89.11% |
-| Qwen3.5-27B-4bit | 4096 | 29.38 tok/s | 48.89 tok/s | 1.66x | 87.99% |
-| Qwen3.5-35B-A3B-4bit | 1024 | 139.97 tok/s | 242.92 tok/s | 1.74x | 89.26% |
-| Qwen3.5-35B-A3B-4bit | 2048 | 142.12 tok/s | 240.21 tok/s | 1.69x | 88.67% |
-| Qwen3.5-35B-A3B-4bit | 4096 | 140.73 tok/s | 189.62 tok/s | 1.35x | 86.96% |
+2. **Exact-prefix cache** (`dflash_mlx/serve.py`, `runtime.py`). Rather than fight the trim machinery, the fork snapshots KV state at known-good points and does longest-prefix lookup over stored snapshots. Sidesteps trimming entirely, works for hybrid and pure-attention targets alike.
 
-### Methodology
+3. **Commit-boundary snapshotting.** A naïve snapshot taken at end-of-generation can never match the next request, because the chat template appends a generation-prompt suffix (Qwen3.5: `<|im_start|>assistant\n<think>\n`, 5 tokens) that the next request's history doesn't contain. The runtime detects this suffix and snapshots *before* it, at the boundary of committed conversation content — so any future turn whose committed history matches can hit.
 
-Hardware: Apple M5 Max, 64GB unified memory. MLX 0.31.1 from the stock pip install.
+4. **Server-side `<think>` stripping.** Agent frameworks strip thinking blocks from *historical* assistant turns between requests. The server's snapshot contained them; the client's next prompt didn't — guaranteed cache miss on every turn for thinking models. The fork strips `<think>…</think>` from committed history server-side too, normalizing the cache key so both sides agree.
 
-Protocol: stock `mlx_lm.stream_generate` on a pristine target model vs stock MLX plus the local DFlash runtime, measured sequentially. `3` repeats, median reported, `10s` cooldown between measured runs.
+5. **Whitespace normalization.** After stripping a thinking block, a trailing-whitespace token (e.g. `\n\n`, token 271) is left behind, and clients handle it inconsistently. The cache key eats trailing whitespace tokens after the strip.
 
-Generation: prompt `"The function $f$ satisfies the functional equation \[ f(x) + f(y) = f(x + y) - xy - 1 \] for all real numbers $x$ and $y$. If $f(1) = 1$, then find all integers $n$ such that $f(n) = n$. Enter all such integers, separated by commas. Please reason step by step, and put your final answer within \boxed{}."` with chat templates enabled by default, `--no-eos`, and post-prefill tok/s as the primary metric.
+Plus **MISS-DIAG logging**: on a cache miss with a near-match entry, the server logs the divergence position and decoded token windows around it on both sides. Every root cause above after the first was found this way — the cache is self-diagnosing.
 
-Full per-run JSON reports are available in [`benchmark/results/`](benchmark/results/).
+### Correctness
+
+`--phase warm` vs. server-restart `--phase cold` on identical requests produces **bit-identical output**. The cache changes when prefill happens, never what gets generated.
+
+## DSpark drafter support
+
+The fork also ports the [RadixArk DSpark](https://huggingface.co/RadixArk) drafter family (e.g. `RadixArk/Qwen3.8-27B-DSpark`), which differs from z-lab DFlash drafters in two ways:
+
+- **Shifted next-token semantics**: every block hidden state (anchor included) predicts one position *ahead*, so a block of N inputs proposes N drafts, verified as `[anchor] + drafts`. z-lab drafters mask-fill in place. Getting this wrong is a ~7× acceptance penalty (11.7% vs. 84.6% measured).
+- **Markov bigram-bias head** chained through the block at draft time, matching SGLang's `run_markov_block`.
+
+Measured (M5 Max, Qwen3.8-27B 4-bit target, temp 0): **58 tok/s at 84.6% acceptance on code** vs. 32.6 tok/s plain autoregressive — with acceptance dropping to ~56–64% on freeform prose (adaptive block length via the confidence head is not yet ported). Known ceiling: an 8-token speculative verify costs ~3× a single AR step on hybrid GatedDeltaNet targets; that verify path is the next optimization target.
+
+## Decode benchmarks
+
+Server-reported decode tok/s on the DFlash path, ~1.7k-token context, M5 Max 128 GB:
+
+| Target | Quant | Cold | Warm (cache hit) |
+|---|---|---|---|
+| Qwen3.5-27B (dense hybrid) | 4-bit | 32.8 | 35.5 |
+| Qwen3.5-35B-A3B (MoE, 3B active) | bf16 | 57.8 | 66.4 |
+| Qwen3.5-35B-A3B (MoE, 3B active) | 8-bit | **114.2** | **118.4** |
+
+These track the memory-bandwidth ceiling (614 GB/s ÷ bytes-per-active-token) closely — the MoE 8-bit config decodes at ~80% of the theoretical peak with DFlash verify overhead included. The dense-27B and MoE rows used community-quantized/finetuned MLX builds; decode speed is a function of architecture and quant, not the finetune.
+
+Upstream's DFlash-vs-AR benchmark table for stock models is in the [upstream README](https://github.com/bstnxbt/dflash-mlx#benchmarks); per-run JSON reports in [`benchmark/results/`](benchmark/results/).
 
 ## Install
 
 ```bash
-pip install dflash-mlx
-
-# or with pipx
-pipx install dflash-mlx
+git clone https://github.com/el3mentdev/dflash-mlx-autoresearch
+cd dflash-mlx-autoresearch
+pip install -e .
 ```
 
-`dflash-serve` wraps `mlx_lm.server` for full OpenAI-compatible serving semantics, including tools, reasoning, and streaming, while using the DFlash runtime as the generation engine.
-
-## Quick start
+## Usage
 
 ```bash
-PROMPT='The function $f$ satisfies the functional equation \[ f(x) + f(y) = f(x + y) - xy - 1 \] for all real numbers $x$ and $y$. If $f(1) = 1$, then find all integers $n$ such that $f(n) = n$. Enter all such integers, separated by commas. Please reason step by step, and put your final answer within \boxed{}.'
+# Serve with prefix caching (keep up to 4 KV snapshots)
+dflash-serve --model mlx-community/Qwen3.5-35B-A3B-4bit \
+  --draft-model z-lab/Qwen3.5-35B-A3B-DFlash \
+  --host 127.0.0.1 --port 8000 --prompt-cache-size 4
 
-# Generate — draft auto-resolved
-dflash --model Qwen/Qwen3.5-9B --prompt "$PROMPT"
-
-# Explicit draft model
-dflash --model Qwen/Qwen3.5-9B --draft z-lab/Qwen3.5-9B-DFlash --prompt "$PROMPT"
-
-# Server
-dflash-serve --model Qwen/Qwen3.5-9B --port 8000
-
-# Disable visible thinking/reasoning on models that support it
-dflash-serve --model Qwen/Qwen3.5-9B --port 8000 \
-  --chat-template-args '{"enable_thinking": false}'
-
-# Raise the DFlash fallback threshold for longer prompts
-dflash-serve --model mlx-community/Qwen3.5-35B-A3B-4bit --port 8000 \
-  --chat-template-args '{"enable_thinking": false}' \
-  --dflash-max-ctx 16384
-
-# Benchmark
-dflash-benchmark --model Qwen/Qwen3.5-9B --draft z-lab/Qwen3.5-9B-DFlash \
-  --prompt "$PROMPT" --max-tokens 1024 --repeat 3 --no-eos
-
-# Live demo — baseline vs DFlash side-by-side
-PYTHONPATH=. python3 -m examples.demo --mode dflash \
-  --target-model Qwen/Qwen3.5-9B --draft-model z-lab/Qwen3.5-9B-DFlash \
-  --prompt "$PROMPT" --max-tokens 2048 --no-eos
+# DSpark drafter
+dflash-serve --model mlx-community/Qwen3.8-27B-4bit \
+  --draft-model RadixArk/Qwen3.8-27B-DSpark \
+  --host 127.0.0.1 --port 8000 --prompt-cache-size 4
 ```
 
-- Compatible with Open WebUI, Continue, OpenCode, aider, and other OpenAI-compatible clients
-- Streaming SSE support
-- `dflash-serve` requires a supported DFlash draft model (auto-detected from the registry or passed explicitly with `--draft`)
+Watch stderr for `[dflash] prefix cache HIT/STORED` lines and per-turn tok/s. On a miss with a near-match, `MISS-DIAG` lines show exactly where the incoming prompt diverged from the best snapshot.
 
-## Tested models
+`--draft-model` accepts a local directory path as well as a HuggingFace repo id.
 
-Any model with a DFlash draft on HuggingFace should work.
+### Getting cache hits from your agent harness
 
-Optimized for Qwen3.5 models (hybrid GatedDeltaNet + attention architecture). Qwen3 (pure attention) models work, but without the precision benefits of tape-replay rollback.
+The cache can only help if the client resends a strict prefix. What matters, from testing real harnesses:
 
-| Target | Draft |
-|--------|-------|
-| [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) | [z-lab/Qwen3.5-4B-DFlash](https://huggingface.co/z-lab/Qwen3.5-4B-DFlash) |
-| [Qwen/Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B) | [z-lab/Qwen3.5-9B-DFlash](https://huggingface.co/z-lab/Qwen3.5-9B-DFlash) |
-| [mlx-community/Qwen3.5-27B-4bit](https://huggingface.co/mlx-community/Qwen3.5-27B-4bit) | [z-lab/Qwen3.5-27B-DFlash](https://huggingface.co/z-lab/Qwen3.5-27B-DFlash) |
-| [mlx-community/Qwen3.5-35B-A3B-4bit](https://huggingface.co/mlx-community/Qwen3.5-35B-A3B-4bit) | [z-lab/Qwen3.5-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.5-35B-A3B-DFlash) |
+- **Static system prompt** — per-turn injection of cwd/timestamps into early tokens poisons every snapshot.
+- **Append-only history** — context compaction that rewrites earlier turns (LLM summaries) breaks prefix extension.
 
-Models without a matching DFlash draft are rejected. Pass `--draft` explicitly if you want to override the registry.
+(Upstream's fast-path AR bypass for `max_tokens <= 256` is disabled in this fork, so short requests take the DFlash path and hit the cache like any other.)
 
-## Features
+Thinking-block stripping by the client is fine — that's what the server-side normalization is for.
 
-- **Auto draft resolution** — no manual `--draft` flag needed
-- **Streaming** — token-by-token output in the CLI and server
-- **Chat templates** — enabled by default
-- **Recurrent rollback** — `RecurrentRollbackCache` keeps GatedDeltaNet state coherent across speculative verify and rollback
+## autoresearch harness
+
+`autoresearch/` contains a pinned, seeded Spec-Bench harness (adapted from [karpathy/autoresearch](https://github.com/karpathy/autoresearch)) for measuring runtime changes: 10 balanced prompts, fixed budgets, `speedup` as the primary metric and token-match rate against the baseline greedy trajectory as the guard rail. Model and dataset locations are overridable via `AUTORESEARCH_TARGET_MODEL`, `AUTORESEARCH_DRAFT_MODEL`, and `AUTORESEARCH_SPECBENCH_QUESTIONS`.
 
 ## Roadmap
 
-- Sustained acceptance at 4096+ tokens — draft KV cache window scaling and long-context verify optimization
-- Draft model distillation and compression for faster draft forward
+- **SSD-backed snapshot persistence** — survive server restarts; ~14 GB/s SSD loads a 1 GB snapshot in ~70 ms
+- **DSpark confidence head** — adaptive block length, mainly to recover prose acceptance
+- **Hybrid verify cost** — the 3× verify-vs-AR-step gap on GatedDeltaNet targets is the biggest remaining decode lever
+- **MoE block-size tuning** — current `DFLASH_VERIFY_LEN` / `block_tokens` values were tuned on dense targets
 
-## Citation
+## Relationship to upstream
+
+Built on [bstnxbt/dflash-mlx](https://github.com/bstnxbt/dflash-mlx) v0.1.3, which implements the DFlash runtime (tape-replay rollback, JIT SDPA 2-pass verify, custom Metal kernels) for MLX. The exact-prefix cache fix is general-purpose and a candidate for upstreaming; the thinking-strip and commit-boundary layers are opinionated toward agent workloads and live here.
+
+DFlash itself is the work of [z-lab](https://github.com/z-lab/dflash) — paper: [DFlash: Block Diffusion for Flash Speculative Decoding](https://arxiv.org/abs/2602.06036) (Chen et al., 2026) — including the draft models used here. DSpark drafters by [RadixArk](https://huggingface.co/RadixArk).
 
 ```bibtex
 @misc{chen2026dflash,
@@ -148,4 +132,4 @@ Models without a matching DFlash draft are rejected. Pass `--draft` explicitly i
 
 ## License
 
-MIT
+MIT — same as upstream.
