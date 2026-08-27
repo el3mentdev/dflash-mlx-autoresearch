@@ -21,6 +21,11 @@ Speculative decoding solves decode speed. What it doesn't solve is that agent ha
 | Decode, Qwen3.5-35B-A3B (8-bit MLX) | 114.2 tok/s cold | **118.4 tok/s warm** |
 | Correctness (warm vs. cold output) | — | **bit-identical** |
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/prefill-dark.svg">
+  <img alt="Bar chart: cold-start prefill of a 27k-token agent prompt takes 85 seconds; a warm turn with a prefix-cache hit takes 1.5 seconds — 57 times less time in prefill." src="docs/img/prefill-light.svg">
+</picture>
+
 ## Why the stock prompt cache wasn't enough
 
 The journey here is five root causes deep, each found by instrumenting real agent sessions (opencode, pi) against the server:

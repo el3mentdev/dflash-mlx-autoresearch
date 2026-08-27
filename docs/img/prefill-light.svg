@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 210" width="720" height="210" role="img" aria-label="Prefill time — 27k-token agent prompt">
+<rect width="720" height="210" rx="8" fill="#fcfcfb"/>
+<text x="24" y="34" font-family="system-ui,-apple-system,Segoe UI,sans-serif" font-size="16" font-weight="600" fill="#0b0b0b">Prefill time — 27k-token agent prompt</text>
+<text x="24" y="54" font-family="system-ui,-apple-system,Segoe UI,sans-serif" font-size="12.5" fill="#898781">dflash-serve on M5 Max · warm turn re-prefills only the 229-token suffix</text>
+<text x="158" y="107" font-family="system-ui,-apple-system,Segoe UI,sans-serif" font-size="13" fill="#52514e" text-anchor="end">Cold start</text>
+<path d="M 170 88 H 656.0 Q 660.0 88 660.0 92 V 112 Q 660.0 116 656.0 116 H 170 Z" fill="#86b6ef"/>
+<text x="670.0" y="107" font-family="system-ui,-apple-system,Segoe UI,sans-serif" font-size="13" font-weight="600" fill="#0b0b0b">85 s</text>
+<text x="158" y="155" font-family="system-ui,-apple-system,Segoe UI,sans-serif" font-size="13" fill="#52514e" text-anchor="end">Warm · cache hit</text>
+<path d="M 170 136 H 174.64705882352942 Q 178.64705882352942 136 178.64705882352942 140 V 160 Q 178.64705882352942 164 174.64705882352942 164 H 170 Z" fill="#2a78d6"/>
+<text x="188.64705882352942" y="155" font-family="system-ui,-apple-system,Segoe UI,sans-serif" font-size="13" font-weight="600" fill="#0b0b0b">1.5 s</text>
+<text x="240" y="174" font-family="system-ui,-apple-system,Segoe UI,sans-serif" font-size="12.5" fill="#898781">57× less time in prefill</text>
+<line x1="170" y1="80" x2="170" y2="188" stroke="#c3c2b7" stroke-width="1"/>
+</svg>
