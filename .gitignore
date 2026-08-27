@@ -17,3 +17,7 @@ CLAUDE.md
 benchmark/datasets/
 .aider*
 .idea/
+
+# autoresearch experiment artifacts
+autoresearch/results.tsv
+autoresearch/run.log
