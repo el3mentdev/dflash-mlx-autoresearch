@@ -42,6 +42,40 @@ from dflash_mlx.runtime import stream_dflash_generate
 _STATEFUL_SERVER_API = "state" in getattr(mlx_server.Response, "__annotations__", {})
 
 
+def _compute_gen_prompt_suffix(tokenizer: Any) -> tuple[int, ...]:
+    """Return the token suffix that the chat template appends when
+    add_generation_prompt=True compared to False (e.g., Qwen3.5 adds
+    `<|im_start|>assistant\\n<think>\\n` when thinking is enabled).
+
+    Returns () if the tokenizer doesn't have a chat template, the template
+    doesn't cleanly append, or anything goes wrong. The prefix cache still
+    works in that case — it just keys on the full prompt (exact match only).
+    """
+    try:
+        with_prompt = list(
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": "x"}],
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+        )
+        without_prompt = list(
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": "x"}],
+                tokenize=True,
+                add_generation_prompt=False,
+            )
+        )
+    except Exception:
+        return ()
+    if (
+        len(with_prompt) <= len(without_prompt)
+        or with_prompt[: len(without_prompt)] != without_prompt
+    ):
+        return ()
+    return tuple(int(t) for t in with_prompt[len(without_prompt):])
+
+
 def _read_project_version() -> str:
     try:
         return package_version("dflash-mlx")
@@ -220,17 +254,56 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
             live_prompt_len = len(prompt)
             printed_prefill_progress = False
 
-            # Prefix cache: exact-match on tokenized prompt.
-            # Works with hybrid-attention targets where mlx_lm's trie cache
-            # can't — we never trim, only match exact prefills.
+            # Prefix cache: longest-prefix match on tokenized prompt, keyed on the
+            # "committed" prefix (everything before the generation-prompt suffix that
+            # the chat template appends when add_generation_prompt=True). Without this
+            # trim, Qwen3.5's trailing `<think>\n` (2 tokens) makes turn 1's stored
+            # tokens NOT a byte-prefix of turn 2's, so partial hits never fire.
             import copy as _copy_mod
             if not hasattr(self, "_dflash_prefix_cache"):
-                self._dflash_prefix_cache = {}
-                self._dflash_prefix_lru = []
-            _prefix_key = (self.model_provider.model_key, tuple(prompt))
+                # list of entries in LRU order (oldest first, newest last).
+                # entry = {"model_key", "tokens": tuple[int], "snapshot": dict}
+                self._dflash_prefix_cache = []
+            if not hasattr(self, "_dflash_gen_prompt_suffix"):
+                self._dflash_gen_prompt_suffix = _compute_gen_prompt_suffix(tokenizer)
+                sys.stderr.write(
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] gen-prompt suffix: "
+                    f"{len(self._dflash_gen_prompt_suffix)} token(s) "
+                    f"{list(self._dflash_gen_prompt_suffix)!r}\n"
+                )
+                sys.stderr.flush()
+            _prompt_tuple = tuple(prompt)
+            _model_key = self.model_provider.model_key
+            _suffix = self._dflash_gen_prompt_suffix
+            if (
+                _suffix
+                and len(_prompt_tuple) > len(_suffix)
+                and _prompt_tuple[-len(_suffix):] == _suffix
+            ):
+                _commit_boundary = len(_prompt_tuple) - len(_suffix)
+            else:
+                _commit_boundary = len(_prompt_tuple)
+            _commit_tuple = _prompt_tuple[:_commit_boundary]
+
             _cache_snapshot_in: Optional[dict[str, Any]] = None
-            if _prefix_key in self._dflash_prefix_cache:
-                _stored = self._dflash_prefix_cache[_prefix_key]
+            _hit_tokens: Optional[tuple] = None
+            _hit_len = 0
+            _best_i = -1
+            _best_len = 0
+            for _i, _entry in enumerate(self._dflash_prefix_cache):
+                if _entry["model_key"] != _model_key:
+                    continue
+                _cached_tokens = _entry["tokens"]
+                _cached_len = len(_cached_tokens)
+                if _cached_len == 0 or _cached_len > len(_prompt_tuple) or _cached_len <= _best_len:
+                    continue
+                if _prompt_tuple[:_cached_len] == _cached_tokens:
+                    _best_i = _i
+                    _best_len = _cached_len
+            if _best_i >= 0:
+                _stored = self._dflash_prefix_cache[_best_i]["snapshot"]
+                _hit_tokens = self._dflash_prefix_cache[_best_i]["tokens"]
+                _hit_len = _best_len
                 _cache_snapshot_in = {
                     "target_cache": _copy_mod.deepcopy(_stored["target_cache"]),
                     "target_hidden": _stored["target_hidden"],
@@ -240,13 +313,18 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                     "prefill_ns": _stored["prefill_ns"],
                     "prompt_len": _stored["prompt_len"],
                 }
-                ctx.prompt_cache_count = len(prompt)
-                self._dflash_prefix_lru.remove(_prefix_key)
-                self._dflash_prefix_lru.append(_prefix_key)
+                ctx.prompt_cache_count = _hit_len
+                _match_kind = "exact" if _hit_len == len(prompt) else "prefix"
                 sys.stderr.write(
-                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] prefix cache HIT | prompt={len(prompt)} tokens\n"
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] prefix cache HIT ({_match_kind}) | "
+                    f"matched={_hit_len}/{len(prompt)} tokens "
+                    f"(commit_boundary={_commit_boundary})\n"
                 )
                 sys.stderr.flush()
+            # Emit snapshot whenever phase 1 will do new committed work
+            # (hit length < commit boundary). Skip when the cache already covers
+            # exactly the committed prefix.
+            _emit_snapshot = _hit_len < _commit_boundary
             event_iter = stream_dflash_generate(
                 target_model=model,
                 tokenizer=tokenizer,
@@ -257,14 +335,15 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                 stop_token_ids=stop_token_ids,
                 prompt_tokens_override=prompt,
                 cache_snapshot=_cache_snapshot_in,
-                emit_cache_snapshot=(_cache_snapshot_in is None),
+                emit_cache_snapshot=_emit_snapshot,
+                commit_boundary=_commit_boundary,
             )
 
             try:
                 for event in event_iter:
                     if event.get("event") == "cache_snapshot":
                         # Deep-copy and store the pristine post-prefill state so
-                        # future calls with the same prompt can skip prefill.
+                        # future calls with a matching prefix can skip prefill.
                         try:
                             _snap = {
                                 "target_cache": _copy_mod.deepcopy(event["target_cache"]),
@@ -275,20 +354,43 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                                 "prefill_ns": int(event.get("prefill_ns", 0)),
                                 "prompt_len": int(event.get("prompt_len", len(prompt))),
                             }
-                            self._dflash_prefix_cache[_prefix_key] = _snap
-                            if _prefix_key in self._dflash_prefix_lru:
-                                self._dflash_prefix_lru.remove(_prefix_key)
-                            self._dflash_prefix_lru.append(_prefix_key)
+                            _entry_tokens = _prompt_tuple[: _snap["prompt_len"]]
+                            _new_entry = {
+                                "model_key": _model_key,
+                                "tokens": _entry_tokens,
+                                "snapshot": _snap,
+                            }
                             _max_size = max(
                                 1, int(getattr(self.model_provider.cli_args, "prompt_cache_size", 4))
                             )
-                            while len(self._dflash_prefix_lru) > _max_size:
-                                _oldest = self._dflash_prefix_lru.pop(0)
-                                self._dflash_prefix_cache.pop(_oldest, None)
+                            # Replace-on-hit: if this prompt extends an entry we just hit
+                            # AND the new entry is at least as long, drop the older
+                            # (shorter) entry so a single growing conversation occupies
+                            # one LRU slot instead of N. Skip replacement when the new
+                            # entry would be shorter (rare — conversation shrinking).
+                            if _hit_tokens is not None and len(_entry_tokens) >= len(_hit_tokens):
+                                self._dflash_prefix_cache = [
+                                    e for e in self._dflash_prefix_cache
+                                    if not (
+                                        e["model_key"] == _model_key
+                                        and e["tokens"] == _hit_tokens
+                                    )
+                                ]
+                            # Dedupe exact-length duplicates for this new key.
+                            self._dflash_prefix_cache = [
+                                e for e in self._dflash_prefix_cache
+                                if not (
+                                    e["model_key"] == _model_key
+                                    and e["tokens"] == _entry_tokens
+                                )
+                            ]
+                            self._dflash_prefix_cache.append(_new_entry)
+                            while len(self._dflash_prefix_cache) > _max_size:
+                                self._dflash_prefix_cache.pop(0)
                             sys.stderr.write(
                                 f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] prefix cache STORED | "
                                 f"prompt={_snap['prompt_len']} tokens | "
-                                f"size={len(self._dflash_prefix_lru)}/{_max_size}\n"
+                                f"size={len(self._dflash_prefix_cache)}/{_max_size}\n"
                             )
                             sys.stderr.flush()
                         except Exception as _store_exc:

@@ -1448,6 +1448,7 @@ def stream_dflash_generate(
     quantize_kv_cache: bool = False,
     cache_snapshot: Optional[dict[str, Any]] = None,
     emit_cache_snapshot: bool = False,
+    commit_boundary: Optional[int] = None,
 ) -> Iterator[dict[str, Any]]:
     if quantize_kv_cache:
         configure_full_attention_split(target_model, enabled=False)
@@ -1490,12 +1491,25 @@ def stream_dflash_generate(
         start_ns = time.perf_counter_ns()
         prefill_start_ns = time.perf_counter_ns()
 
-        # Fast path: exact-prefix cache hit — skip the whole target prefill.
-        # The server is responsible for deep-copying the snapshot before passing it.
-        if (
-            cache_snapshot is not None
-            and cache_snapshot.get("prompt_len") == prompt_len
-        ):
+        # commit_boundary = end of the stable conversation content (no generation-prompt
+        # suffix tokens like Qwen's trailing `<think>\n`). Snapshot is taken HERE, not at
+        # prompt_len, so future turns whose tokens match the committed prefix can hit.
+        if commit_boundary is None or commit_boundary < 0 or commit_boundary > prompt_len:
+            commit_boundary = prompt_len
+
+        cached_len = (
+            int(cache_snapshot.get("prompt_len", 0))
+            if cache_snapshot is not None
+            else 0
+        )
+        if cached_len > prompt_len:
+            # Stale snapshot — treat as cold.
+            cache_snapshot = None
+            cached_len = 0
+
+        # Fast path: snapshot matches the full request exactly (only possible when the
+        # stored snapshot key equals prompt_len, i.e., raw-completion round-trip).
+        if cache_snapshot is not None and cached_len == prompt_len:
             target_cache = cache_snapshot["target_cache"]
             target_hidden = cache_snapshot["target_hidden"]
             staged_first = cache_snapshot["staged_first"]
@@ -1507,36 +1521,52 @@ def stream_dflash_generate(
                 "prefill_us": prefill_ns / 1_000.0,
                 "prompt_token_count": prompt_len,
                 "cached_prefill": True,
+                "cached_len": prompt_len,
             }
         else:
-            target_cache = make_target_cache(
-                target_model,
-                enable_speculative_linear_cache=True,
-                quantize_kv_cache=quantize_kv_cache,
-            )
-            draft_cache = [
-                ContextOnlyDraftKVCache(
-                    sink_size=draft_sink_size,
-                    window_size=draft_window_size,
+            if cache_snapshot is not None:
+                target_cache = cache_snapshot["target_cache"]
+                cached_target_hidden = cache_snapshot["target_hidden"]
+                draft_cache = cache_snapshot["draft_cache"]
+                cached_suppress_mask = cache_snapshot.get("suppress_token_mask")
+                cached_staged_first = cache_snapshot.get("staged_first")
+            else:
+                target_cache = make_target_cache(
+                    target_model,
+                    enable_speculative_linear_cache=True,
+                    quantize_kv_cache=quantize_kv_cache,
                 )
-                for _ in range(len(draft_model.layers))
-            ]
+                draft_cache = [
+                    ContextOnlyDraftKVCache(
+                        sink_size=draft_sink_size,
+                        window_size=draft_window_size,
+                    )
+                    for _ in range(len(draft_model.layers))
+                ]
+                cached_target_hidden = None
+                cached_suppress_mask = None
+                cached_staged_first = None
+
             prefill_step_size = 2048
-            prefill_logits = None
-            target_hidden_chunks: list[mx.array] = []
-            for chunk_start in range(0, prompt_len, prefill_step_size):
-                chunk_end = min(chunk_start + prefill_step_size, prompt_len)
+            phase1_end = max(cached_len, min(commit_boundary, prompt_len))
+
+            # Phase 1: forward on [cached_len : phase1_end]. Extends target_cache to
+            # phase1_end (== commit_boundary when prompt has a generation-prompt suffix).
+            phase1_logits = None
+            phase1_hidden_chunks: list[mx.array] = []
+            for chunk_start in range(cached_len, phase1_end, prefill_step_size):
+                chunk_end = min(chunk_start + prefill_step_size, phase1_end)
                 chunk_ids = prompt_array[:, chunk_start:chunk_end]
-                prefill_logits, prefill_hidden_states = target_forward_with_hidden_states(
+                phase1_logits, phase1_hidden_states = target_forward_with_hidden_states(
                     target_model,
                     input_ids=chunk_ids,
                     cache=target_cache,
                     capture_layer_ids=capture_layer_ids,
                 )
-                _eval_logits_and_captured(prefill_logits, prefill_hidden_states)
-                target_hidden_chunks.append(
+                _eval_logits_and_captured(phase1_logits, phase1_hidden_states)
+                phase1_hidden_chunks.append(
                     extract_context_feature_from_dict(
-                        prefill_hidden_states,
+                        phase1_hidden_states,
                         list(draft_model.target_layer_ids),
                     )
                 )
@@ -1545,37 +1575,127 @@ def stream_dflash_generate(
                     "tokens_processed": chunk_end,
                     "tokens_total": prompt_len,
                 }
+
+            # committed_hidden represents target-hidden features through phase1_end.
+            if phase1_hidden_chunks:
+                phase1_hidden = (
+                    phase1_hidden_chunks[0]
+                    if len(phase1_hidden_chunks) == 1
+                    else mx.concatenate(phase1_hidden_chunks, axis=1)
+                )
+                committed_hidden = (
+                    mx.concatenate([cached_target_hidden, phase1_hidden], axis=1)
+                    if cached_target_hidden is not None
+                    else phase1_hidden
+                )
+            else:
+                committed_hidden = cached_target_hidden  # may be None
+
+            # Resolve suppress mask: cache > fresh phase1 logits > deferred.
+            if cached_suppress_mask is not None:
+                commit_suppress_mask = cached_suppress_mask
+            elif phase1_logits is not None:
+                commit_suppress_mask = build_suppress_token_mask(
+                    int(phase1_logits.shape[-1]), suppress_token_ids
+                )
+            else:
+                commit_suppress_mask = None
+
+            if phase1_logits is not None:
+                staged_first_at_commit = greedy_tokens_with_mask(
+                    phase1_logits[:, -1, :], commit_suppress_mask
+                ).reshape(-1)
+            else:
+                staged_first_at_commit = cached_staged_first
+
+            # Emit snapshot at the commit boundary — the stable, generation-prompt-free
+            # state that future turns of the same conversation can prefix-match against.
+            # Server deep-copies on receipt (before phase 2 mutates target_cache).
+            did_phase1 = phase1_end > cached_len
+            # Snapshot iff phase 1 did new work — that guarantees phase1_logits is
+            # populated, so committed_hidden and staged_first_at_commit are non-None.
+            # commit_suppress_mask may legitimately be None (no suppression requested);
+            # downstream greedy_tokens_with_mask handles None mask fine.
+            if emit_cache_snapshot and did_phase1:
+                yield {
+                    "event": "cache_snapshot",
+                    "target_cache": target_cache,
+                    "target_hidden": committed_hidden,
+                    "staged_first": staged_first_at_commit,
+                    "suppress_token_mask": commit_suppress_mask,
+                    "draft_cache": draft_cache,
+                    "prefill_ns": int(time.perf_counter_ns() - prefill_start_ns),
+                    "prompt_len": phase1_end,
+                }
+
+            # Phase 2: forward on [phase1_end : prompt_len]. Ephemeral — extends cache
+            # through the generation-prompt suffix but never gets snapshotted (those
+            # tokens diverge from what later turns see in the middle of a conversation).
+            phase2_logits = None
+            phase2_hidden_chunks: list[mx.array] = []
+            for chunk_start in range(phase1_end, prompt_len, prefill_step_size):
+                chunk_end = min(chunk_start + prefill_step_size, prompt_len)
+                chunk_ids = prompt_array[:, chunk_start:chunk_end]
+                phase2_logits, phase2_hidden_states = target_forward_with_hidden_states(
+                    target_model,
+                    input_ids=chunk_ids,
+                    cache=target_cache,
+                    capture_layer_ids=capture_layer_ids,
+                )
+                _eval_logits_and_captured(phase2_logits, phase2_hidden_states)
+                phase2_hidden_chunks.append(
+                    extract_context_feature_from_dict(
+                        phase2_hidden_states,
+                        list(draft_model.target_layer_ids),
+                    )
+                )
+                yield {
+                    "event": "prefill_progress",
+                    "tokens_processed": chunk_end,
+                    "tokens_total": prompt_len,
+                }
+
             prefill_ns = time.perf_counter_ns() - prefill_start_ns
 
-            suppress_token_mask = build_suppress_token_mask(int(prefill_logits.shape[-1]), suppress_token_ids)
-            staged_first = greedy_tokens_with_mask(prefill_logits[:, -1, :], suppress_token_mask).reshape(-1)
-            target_hidden = (
-                target_hidden_chunks[0]
-                if len(target_hidden_chunks) == 1
-                else mx.concatenate(target_hidden_chunks, axis=1)
-            )
+            if phase2_hidden_chunks:
+                phase2_hidden = (
+                    phase2_hidden_chunks[0]
+                    if len(phase2_hidden_chunks) == 1
+                    else mx.concatenate(phase2_hidden_chunks, axis=1)
+                )
+                target_hidden = (
+                    mx.concatenate([committed_hidden, phase2_hidden], axis=1)
+                    if committed_hidden is not None
+                    else phase2_hidden
+                )
+                final_logits = phase2_logits
+            else:
+                target_hidden = committed_hidden
+                final_logits = phase1_logits
+
+            if commit_suppress_mask is not None:
+                suppress_token_mask = commit_suppress_mask
+            elif final_logits is not None:
+                suppress_token_mask = build_suppress_token_mask(
+                    int(final_logits.shape[-1]), suppress_token_ids
+                )
+            else:
+                suppress_token_mask = build_suppress_token_mask(0, suppress_token_ids)
+
+            if final_logits is not None:
+                staged_first = greedy_tokens_with_mask(
+                    final_logits[:, -1, :], suppress_token_mask
+                ).reshape(-1)
+            else:
+                staged_first = staged_first_at_commit
 
             yield {
                 "event": "prefill",
                 "prefill_us": prefill_ns / 1_000.0,
                 "prompt_token_count": prompt_len,
-                "cached_prefill": False,
+                "cached_prefill": cache_snapshot is not None,
+                "cached_len": int(cached_len),
             }
-
-            # Emit snapshot so the server can deep-copy and store for reuse.
-            # This must happen BEFORE the generation loop starts mutating
-            # target_cache / draft_cache. The server must deepcopy immediately.
-            if emit_cache_snapshot:
-                yield {
-                    "event": "cache_snapshot",
-                    "target_cache": target_cache,
-                    "target_hidden": target_hidden,
-                    "staged_first": staged_first,
-                    "suppress_token_mask": suppress_token_mask,
-                    "draft_cache": draft_cache,
-                    "prefill_ns": int(prefill_ns),
-                    "prompt_len": prompt_len,
-                }
 
         draft_block_size = int(draft_model.block_size)
         requested_block_tokens = draft_block_size if block_tokens is None else int(block_tokens)
