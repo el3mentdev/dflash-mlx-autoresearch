@@ -288,7 +288,7 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
         request_tuple = request
         rqueue, request, args = request_tuple
 
-        if args.max_tokens <= 256:
+        if args.max_tokens <= 0:  # disabled: was 256, always use DFlash
             sys.stderr.write(
                 f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] fast-path AR | max_tokens={args.max_tokens}\n"
             )
@@ -503,6 +503,13 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
             # (hit length < commit boundary). Skip when the cache already covers
             # exactly the committed prefix.
             _emit_snapshot = _hit_len < _commit_boundary
+            # Map reasoning_effort → DDTree params
+            _reasoning_effort = getattr(args, "reasoning_effort", None) or os.environ.get("DDTREE_MODE", "adaptive")
+            _ddtree_mode_map = {"low": "off", "medium": "adaptive", "high": "always"}
+            _ddtree_mode = _ddtree_mode_map.get(_reasoning_effort, _reasoning_effort)
+            _tree_budget_map = {"off": 0, "adaptive": 4, "always": 6}
+            _tree_budget = _tree_budget_map.get(_ddtree_mode, 4)
+
             event_iter = stream_dflash_generate(
                 target_model=model,
                 tokenizer=tokenizer,
@@ -515,6 +522,8 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                 cache_snapshot=_cache_snapshot_in,
                 emit_cache_snapshot=_emit_snapshot,
                 commit_boundary=_commit_boundary,
+                ddtree_mode=_ddtree_mode,
+                tree_budget=_tree_budget,
             )
 
             try:
@@ -636,7 +645,7 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                     current_state = "normal"
                     match_sequence: Optional[tuple[int, ...]] = None
                     token_finish_reason: Optional[str] = None
-                    if sm is not None:
+                    if sm is not None and token is not None:
                         sm_state, match_sequence, current_state = sm.match(sm_state, token)
                         if match_sequence is not None and current_state is None:
                             token_finish_reason = "stop"

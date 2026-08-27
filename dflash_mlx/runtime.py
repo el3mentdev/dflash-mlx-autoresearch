@@ -28,6 +28,46 @@ from dflash_mlx.model import (
 )
 from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
 
+# Optional DDTree integration — lazy imports to avoid circular dependency
+# (ddtree_mlx imports from dflash_mlx, so module-level import would deadlock)
+_DDTREE_AVAILABLE: Optional[bool] = None  # resolved on first use
+_ddtree_imports: dict[str, Any] = {}
+
+
+def _ensure_ddtree_imports() -> bool:
+    global _DDTREE_AVAILABLE, _ddtree_imports
+    if _DDTREE_AVAILABLE is not None:
+        return _DDTREE_AVAILABLE
+    try:
+        from ddtree_mlx.runtime import _build_tree_from_mlx_logits
+        from ddtree_mlx.compile import compile_tree
+        from ddtree_mlx.verify import tree_verify_forward
+        from ddtree_mlx.tree import follow_verified_tree
+        from ddtree_mlx.cache import fast_path_commit as ddtree_fast_path_commit
+        from ddtree_mlx.cache import tree_aware_path_commit
+        from ddtree_mlx.runtime import _tree_token_ids
+
+        _ddtree_imports.update({
+            "build_tree": _build_tree_from_mlx_logits,
+            "compile_tree": compile_tree,
+            "tree_verify_forward": tree_verify_forward,
+            "follow_verified_tree": follow_verified_tree,
+            "fast_path_commit": ddtree_fast_path_commit,
+            "tree_aware_path_commit": tree_aware_path_commit,
+            "tree_token_ids": _tree_token_ids,
+        })
+        _DDTREE_AVAILABLE = True
+    except ImportError:
+        _DDTREE_AVAILABLE = False
+    return _DDTREE_AVAILABLE
+
+
+def _resolve_ddtree_acceptance_threshold() -> float:
+    raw = os.environ.get("DDTREE_ACCEPTANCE_THRESHOLD", "").strip()
+    if raw:
+        return float(raw)
+    return 0.65
+
 
 def resolve_model_ref(model_ref: str | Path | None, *, kind: str) -> str:
     if model_ref:
@@ -109,6 +149,32 @@ def greedy_tokens_with_mask(
     floor = mx.array(-1e9, dtype=logits.dtype)
     masked_logits = mx.where(suppress_token_mask, floor, logits)
     return mx.argmax(masked_logits, axis=-1).astype(mx.uint32)
+
+
+def _dspark_draft_block(
+    draft_model: Any,
+    base_logits: mx.array,
+    anchor: mx.array,
+    suppress_token_mask: Optional[mx.array] = None,
+) -> mx.array:
+    """DSpark greedy block proposal (shifted next-token semantics).
+
+    Every block hidden — anchor position included — predicts the token one
+    position ahead, so ``base_logits`` of shape (block_len, vocab) yields
+    block_len drafts. The Markov bigram bias is chained left-to-right, seeded
+    by the anchor (bonus) token, matching SGLang's ``run_markov_block``.
+    """
+    markov_head = getattr(draft_model, "markov_head", None)
+    prev = anchor.reshape(1)
+    drafted: list[mx.array] = []
+    for step in range(int(base_logits.shape[0])):
+        step_logits = base_logits[step][None]
+        if markov_head is not None:
+            step_logits = step_logits + markov_head(prev)
+        token = greedy_tokens_with_mask(step_logits, suppress_token_mask).reshape(1)
+        drafted.append(token)
+        prev = token
+    return mx.concatenate(drafted, axis=0).astype(mx.uint32)
 
 
 def _match_acceptance_length(
@@ -222,6 +288,27 @@ def _resolve_dflash_max_ctx() -> int:
     if max_ctx <= 0:
         return sys.maxsize
     return max_ctx
+
+
+def _resolve_think_budget() -> int:
+    raw = os.environ.get("DFLASH_THINK_BUDGET", "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def _resolve_think_end_id(tokenizer: Any) -> Optional[int]:
+    # Only usable when </think> is a single token (true for Qwen3 vocabs).
+    try:
+        ids = tokenizer.encode("</think>")
+    except Exception:
+        return None
+    if isinstance(ids, list) and len(ids) == 1:
+        return int(ids[0])
+    return None
 
 
 def _resolve_draft_window() -> tuple[int, int]:
@@ -1170,6 +1257,12 @@ def generate_dflash_once(
         mx.array(stop_token_ids, dtype=mx.uint32) if stop_token_ids else None
     )
 
+    # See stream_dflash_generate: force-close <think> after DFLASH_THINK_BUDGET tokens.
+    think_budget = _resolve_think_budget()
+    think_end_id = _resolve_think_end_id(tokenizer) if think_budget > 0 else None
+    think_closed = False
+    think_forced = False
+
     use_speculative_linear_cache = verify_chunk_tokens is None
     target_cache = make_target_cache(
         target_model,
@@ -1221,12 +1314,15 @@ def generate_dflash_once(
         draft_block_size = int(draft_model.block_size)
         requested_block_tokens = draft_block_size if block_tokens is None else int(block_tokens)
         effective_block_tokens = max(1, min(requested_block_tokens, draft_block_size))
+        is_dspark = bool(getattr(draft_model, "is_dspark", False))
+        # DSpark verifies [anchor] + block_len drafts; z-lab verifies the block.
+        verify_width = effective_block_tokens + 1 if is_dspark else effective_block_tokens
         generated_token_buffer = mx.full((max_new_tokens,), draft_model.mask_token_id, dtype=mx.uint32)
         block_token_buffer = mx.full((effective_block_tokens,), draft_model.mask_token_id, dtype=mx.uint32)
         generated_token_count = 0
         accepted_from_draft = 0
         cycles_completed = 0
-        verify_len_cap = _resolve_verify_len_cap(target_model, effective_block_tokens)
+        verify_len_cap = _resolve_verify_len_cap(target_model, verify_width)
         start = prompt_len
 
         draft_ns_total = 0
@@ -1258,7 +1354,9 @@ def generate_dflash_once(
             acceptance_cycle_ns = 0
             hidden_extract_cycle_ns = 0
             remaining = max_new_tokens - generated_token_count
-            block_len = max(1, min(effective_block_tokens, remaining))
+            # DSpark commits up to block_len + 1 tokens (anchor + drafts).
+            block_budget = remaining - 1 if is_dspark else remaining
+            block_len = max(1, min(effective_block_tokens, block_budget))
             block_token_buffer[:block_len] = draft_model.mask_token_id
             block_token_buffer[:1] = staged_first
             block_token_ids = block_token_buffer[:block_len]
@@ -1271,11 +1369,21 @@ def generate_dflash_once(
                     target_hidden=target_hidden,
                     cache=draft_cache,
                 )
-                draft_logits = _lm_head_logits(target_model, draft_hidden[:, 1:, :])
-                mx.async_eval(draft_logits)
-                mx.eval(draft_logits)
-                drafted = greedy_tokens_with_mask(draft_logits, suppress_token_mask).squeeze(0)
-                block_token_ids[1:block_len] = drafted
+                if is_dspark:
+                    draft_logits = _lm_head_logits(target_model, draft_hidden)
+                    dspark_drafted = _dspark_draft_block(
+                        draft_model,
+                        draft_logits[0],
+                        staged_first,
+                        suppress_token_mask,
+                    )
+                    mx.eval(dspark_drafted)
+                else:
+                    draft_logits = _lm_head_logits(target_model, draft_hidden[:, 1:, :])
+                    mx.async_eval(draft_logits)
+                    mx.eval(draft_logits)
+                    drafted = greedy_tokens_with_mask(draft_logits, suppress_token_mask).squeeze(0)
+                    block_token_ids[1:block_len] = drafted
                 draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
                 draft_ns_total += draft_cycle_ns
                 if not seen_draft_cycle:
@@ -1284,7 +1392,12 @@ def generate_dflash_once(
                 else:
                     draft_incremental_ns += draft_cycle_ns
 
-            verify_token_ids = block_token_ids[: min(block_len, verify_len_cap)]
+            if is_dspark and block_len > 1:
+                verify_token_ids = mx.concatenate(
+                    [block_token_ids[:1], dspark_drafted], axis=0
+                )[: min(block_len + 1, verify_len_cap)]
+            else:
+                verify_token_ids = block_token_ids[: min(block_len, verify_len_cap)]
             verify_ids = verify_token_ids[None]
             if use_speculative_linear_cache:
                 _arm_target_rollback_with_prefix(target_cache, prefix_len=start)
@@ -1352,6 +1465,20 @@ def generate_dflash_once(
                 break
 
             staged_first = posterior[acceptance_len : acceptance_len + 1]
+
+            if think_end_id is not None and not think_closed:
+                if bool(
+                    mx.any(
+                        mx.equal(
+                            committed_segment,
+                            mx.array(think_end_id, dtype=mx.uint32),
+                        )
+                    ).item()
+                ):
+                    think_closed = True
+                elif not think_forced and generated_token_count >= think_budget:
+                    staged_first = mx.array([think_end_id], dtype=mx.uint32)
+                    think_forced = True
 
             if profile_cycles:
                 cycle_total_ns = time.perf_counter_ns() - cycle_start_ns
@@ -1449,6 +1576,8 @@ def stream_dflash_generate(
     cache_snapshot: Optional[dict[str, Any]] = None,
     emit_cache_snapshot: bool = False,
     commit_boundary: Optional[int] = None,
+    ddtree_mode: str = "off",
+    tree_budget: int = 4,
 ) -> Iterator[dict[str, Any]]:
     if quantize_kv_cache:
         configure_full_attention_split(target_model, enabled=False)
@@ -1484,6 +1613,14 @@ def stream_dflash_generate(
     stop_token_array = (
         mx.array(stop_token_ids, dtype=mx.uint32) if stop_token_ids else None
     )
+
+    # DFLASH_THINK_BUDGET: force-close an open <think> block after N generated
+    # tokens by staging </think> as the next committed anchor. The forced token
+    # flows through verify like a sampled one, so caches stay coherent.
+    think_budget = _resolve_think_budget()
+    think_end_id = _resolve_think_end_id(tokenizer) if think_budget > 0 else None
+    think_closed = False
+    think_forced = False
 
     capture_layer_ids = {int(layer_id) + 1 for layer_id in draft_model.target_layer_ids}
 
@@ -1700,11 +1837,14 @@ def stream_dflash_generate(
         draft_block_size = int(draft_model.block_size)
         requested_block_tokens = draft_block_size if block_tokens is None else int(block_tokens)
         effective_block_tokens = max(1, min(requested_block_tokens, draft_block_size))
+        is_dspark = bool(getattr(draft_model, "is_dspark", False))
+        # DSpark verifies [anchor] + block_len drafts; z-lab verifies the block.
+        verify_width = effective_block_tokens + 1 if is_dspark else effective_block_tokens
         block_token_buffer = mx.full((effective_block_tokens,), draft_model.mask_token_id, dtype=mx.uint32)
         generated_token_ids: list[int] = []
         accepted_from_draft = 0
         cycles_completed = 0
-        verify_len_cap = _resolve_verify_len_cap(target_model, effective_block_tokens)
+        verify_len_cap = _resolve_verify_len_cap(target_model, verify_width)
         start = prompt_len
 
         draft_ns_total = 0
@@ -1726,6 +1866,25 @@ def stream_dflash_generate(
             "cycle_total": 0,
         }
 
+        # DDTree adaptive routing
+        _ddtree_available = _ensure_ddtree_imports() if ddtree_mode in ("adaptive", "always") else False
+        # DDTree builds its tree from z-lab-shaped draft logits; DSpark drafters
+        # use shifted semantics, so keep them on the single-chain path.
+        _ddtree_active = (
+            ddtree_mode in ("adaptive", "always") and _ddtree_available and not is_dspark
+        )
+        if ddtree_mode in ("adaptive", "always") and not _ddtree_available:
+            sys.stderr.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] WARNING: "
+                f"ddtree_mode={ddtree_mode!r} but ddtree-mlx is not installed. "
+                f"Falling back to DFlash-only.\n"
+            )
+            sys.stderr.flush()
+        _ddtree_threshold = _resolve_ddtree_acceptance_threshold()
+        _ddtree_cycles = 0
+        _dflash_cycles = 0
+        _acceptance_window: list[int] = []
+
         while len(generated_token_ids) < max_new_tokens:
             cycle_start_ns = time.perf_counter_ns()
             draft_cycle_ns = 0
@@ -1735,7 +1894,9 @@ def stream_dflash_generate(
             acceptance_cycle_ns = 0
             hidden_extract_cycle_ns = 0
             remaining = max_new_tokens - len(generated_token_ids)
-            block_len = max(1, min(effective_block_tokens, remaining))
+            # DSpark commits up to block_len + 1 tokens (anchor + drafts).
+            block_budget = remaining - 1 if is_dspark else remaining
+            block_len = max(1, min(effective_block_tokens, block_budget))
             block_token_buffer[:block_len] = draft_model.mask_token_id
             block_token_buffer[:1] = staged_first
             block_token_ids = block_token_buffer[:block_len]
@@ -1748,11 +1909,21 @@ def stream_dflash_generate(
                     target_hidden=target_hidden,
                     cache=draft_cache,
                 )
-                draft_logits = _lm_head_logits(target_model, draft_hidden[:, 1:, :])
-                mx.async_eval(draft_logits)
-                mx.eval(draft_logits)
-                drafted = greedy_tokens_with_mask(draft_logits, suppress_token_mask).squeeze(0)
-                block_token_ids[1:block_len] = drafted
+                if is_dspark:
+                    draft_logits = _lm_head_logits(target_model, draft_hidden)
+                    dspark_drafted = _dspark_draft_block(
+                        draft_model,
+                        draft_logits[0],
+                        staged_first,
+                        suppress_token_mask,
+                    )
+                    mx.eval(dspark_drafted)
+                else:
+                    draft_logits = _lm_head_logits(target_model, draft_hidden[:, 1:, :])
+                    mx.async_eval(draft_logits)
+                    mx.eval(draft_logits)
+                    drafted = greedy_tokens_with_mask(draft_logits, suppress_token_mask).squeeze(0)
+                    block_token_ids[1:block_len] = drafted
                 draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
                 draft_ns_total += draft_cycle_ns
                 if not seen_draft_cycle:
@@ -1761,56 +1932,152 @@ def stream_dflash_generate(
                 else:
                     draft_incremental_ns += draft_cycle_ns
 
-            verify_token_ids = block_token_ids[: min(block_len, verify_len_cap)]
-            verify_ids = verify_token_ids[None]
-            _arm_target_rollback_with_prefix(target_cache, prefix_len=start)
-            verify_start_ns = time.perf_counter_ns()
-            verify_logits, verify_hidden_states = _verify_target_block(
-                target_model=target_model,
-                verify_ids=verify_ids,
-                target_cache=target_cache,
-                verify_chunk_tokens=None,
-                capture_layer_ids=capture_layer_ids,
-            )
-            if profile_cycles:
-                _eval_logits_and_captured(verify_logits, verify_hidden_states)
-            verify_cycle_ns = time.perf_counter_ns() - verify_start_ns
-            verify_ns_total += verify_cycle_ns
+            # --- Per-cycle DDTree routing decision ---
+            _use_ddtree_this_cycle = False
+            if _ddtree_active:
+                if ddtree_mode == "always":
+                    _use_ddtree_this_cycle = True
+                elif ddtree_mode == "adaptive" and len(_acceptance_window) >= 2:
+                    _recent_avg = sum(_acceptance_window[-5:]) / len(_acceptance_window[-5:])
+                    _use_ddtree_this_cycle = _recent_avg < _ddtree_threshold * effective_block_tokens
 
-            acceptance_start_ns = time.perf_counter_ns()
-            posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
-            acceptance_len = int(
-                _match_acceptance_length(verify_token_ids[1:], posterior[:-1]).item()
-            )
-            acceptance_cycle_ns = time.perf_counter_ns() - acceptance_start_ns
-            hidden_extract_start_ns = time.perf_counter_ns()
-            committed_hidden = extract_context_feature_from_dict(
-                verify_hidden_states,
-                list(draft_model.target_layer_ids),
-            )[:, : (1 + acceptance_len), :]
-            mx.eval(committed_hidden, posterior)
-            hidden_extract_cycle_ns = time.perf_counter_ns() - hidden_extract_start_ns
+            if _use_ddtree_this_cycle and block_len > 1:
+                # ── DDTree path: tree_build → tree_verify → tree_walk → commit ──
+                # Key: use tree_aware_linear=True so recurrent (GatedDeltaNet)
+                # layers fork state per branch. Without this, recurrent state
+                # is corrupted and output degenerates.
+                _ddtree_cycles += 1
+                root_token = int(staged_first.item())
 
-            commit_count = 1 + acceptance_len
-            committed_segment = verify_token_ids[:commit_count]
-            commit_start_ns = time.perf_counter_ns()
-            start += commit_count
-            target_hidden = committed_hidden
-            replay_cycle_ns = _restore_target_cache_after_acceptance(
-                target_cache,
-                target_len=start,
-                acceptance_length=acceptance_len,
-                drafted_tokens=block_len - 1,
-            )
-            replay_ns_total += replay_cycle_ns
-            cycles_completed += 1
-            commit_wall_ns = time.perf_counter_ns() - commit_start_ns
-            commit_ns_total += commit_wall_ns
-            commit_cycle_ns = max(0, commit_wall_ns - replay_cycle_ns)
+                verify_start_ns = time.perf_counter_ns()
+                # Do NOT arm rollback when tree-aware — tree_verify_forward
+                # manages recurrent state internally via per-node forking.
+                tree = _ddtree_imports["build_tree"](draft_logits[0], budget=tree_budget)
+                compiled = _ddtree_imports["compile_tree"](tree, root_token, prefix_len=start)
 
-            accepted_from_draft += acceptance_len
-            committed_ids = [int(token_id) for token_id in committed_segment.tolist()]
+                _tree_cache_state: dict[str, Any] = {}
+                tree_logits, tree_hidden_states = _ddtree_imports["tree_verify_forward"](
+                    target_model,
+                    compiled_tree=compiled,
+                    cache=target_cache,
+                    capture_layer_ids=capture_layer_ids,
+                    tree_aware_linear=True,
+                    tree_cache_state=_tree_cache_state,
+                )
+                mx.eval(tree_logits)
+                verify_cycle_ns = time.perf_counter_ns() - verify_start_ns
+                verify_ns_total += verify_cycle_ns
+
+                acceptance_start_ns = time.perf_counter_ns()
+                posterior = greedy_tokens_with_mask(tree_logits[0], suppress_token_mask)
+                posterior_list = posterior.tolist()
+                accepted_indices, bonus_token = _ddtree_imports["follow_verified_tree"](
+                    tree.child_maps, posterior_list
+                )
+                acceptance_len = len(accepted_indices) - 1  # exclude root (it's the staged_first)
+                acceptance_cycle_ns = time.perf_counter_ns() - acceptance_start_ns
+
+                hidden_extract_start_ns = time.perf_counter_ns()
+                all_hidden = extract_context_feature_from_dict(
+                    tree_hidden_states,
+                    list(draft_model.target_layer_ids),
+                )
+                accepted_idx_array = mx.array(accepted_indices, dtype=mx.int32)
+                committed_hidden = all_hidden[:, accepted_idx_array, :]
+                mx.eval(committed_hidden)
+                hidden_extract_cycle_ns = time.perf_counter_ns() - hidden_extract_start_ns
+
+                commit_count = len(accepted_indices)
+                accepted_token_ids = _ddtree_imports["tree_token_ids"](tree, root_token, accepted_indices)
+                committed_segment = mx.array(accepted_token_ids, dtype=mx.uint32)
+
+                commit_start_ns = time.perf_counter_ns()
+                # tree_aware_path_commit installs correct recurrent state for
+                # the accepted path and packs attention KV entries.
+                _ddtree_imports["tree_aware_path_commit"](
+                    target_cache,
+                    prefix_len=start,
+                    accepted_indices=accepted_indices,
+                    tree_cache_state=_tree_cache_state,
+                )
+                start += commit_count
+                target_hidden = committed_hidden
+                replay_cycle_ns = 0
+                replay_ns_total += replay_cycle_ns
+                cycles_completed += 1
+                commit_wall_ns = time.perf_counter_ns() - commit_start_ns
+                commit_ns_total += commit_wall_ns
+                commit_cycle_ns = max(0, commit_wall_ns - replay_cycle_ns)
+
+                accepted_from_draft += acceptance_len
+                _acceptance_window.append(acceptance_len)
+                committed_ids = accepted_token_ids
+                staged_first = mx.array([bonus_token], dtype=mx.uint32)
+
+            else:
+                # ── DFlash path: single-chain verify (existing, unchanged) ──
+                _dflash_cycles += 1
+                if is_dspark and block_len > 1:
+                    verify_token_ids = mx.concatenate(
+                        [block_token_ids[:1], dspark_drafted], axis=0
+                    )[: min(block_len + 1, verify_len_cap)]
+                else:
+                    verify_token_ids = block_token_ids[: min(block_len, verify_len_cap)]
+                verify_ids = verify_token_ids[None]
+                _arm_target_rollback_with_prefix(target_cache, prefix_len=start)
+                verify_start_ns = time.perf_counter_ns()
+                verify_logits, verify_hidden_states = _verify_target_block(
+                    target_model=target_model,
+                    verify_ids=verify_ids,
+                    target_cache=target_cache,
+                    verify_chunk_tokens=None,
+                    capture_layer_ids=capture_layer_ids,
+                )
+                if profile_cycles:
+                    _eval_logits_and_captured(verify_logits, verify_hidden_states)
+                verify_cycle_ns = time.perf_counter_ns() - verify_start_ns
+                verify_ns_total += verify_cycle_ns
+
+                acceptance_start_ns = time.perf_counter_ns()
+                posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
+                acceptance_len = int(
+                    _match_acceptance_length(verify_token_ids[1:], posterior[:-1]).item()
+                )
+                acceptance_cycle_ns = time.perf_counter_ns() - acceptance_start_ns
+                hidden_extract_start_ns = time.perf_counter_ns()
+                committed_hidden = extract_context_feature_from_dict(
+                    verify_hidden_states,
+                    list(draft_model.target_layer_ids),
+                )[:, : (1 + acceptance_len), :]
+                mx.eval(committed_hidden, posterior)
+                hidden_extract_cycle_ns = time.perf_counter_ns() - hidden_extract_start_ns
+
+                commit_count = 1 + acceptance_len
+                committed_segment = verify_token_ids[:commit_count]
+                commit_start_ns = time.perf_counter_ns()
+                start += commit_count
+                target_hidden = committed_hidden
+                replay_cycle_ns = _restore_target_cache_after_acceptance(
+                    target_cache,
+                    target_len=start,
+                    acceptance_length=acceptance_len,
+                    drafted_tokens=int(verify_token_ids.shape[0]) - 1,
+                )
+                replay_ns_total += replay_cycle_ns
+                cycles_completed += 1
+                commit_wall_ns = time.perf_counter_ns() - commit_start_ns
+                commit_ns_total += commit_wall_ns
+                commit_cycle_ns = max(0, commit_wall_ns - replay_cycle_ns)
+
+                accepted_from_draft += acceptance_len
+                _acceptance_window.append(acceptance_len)
+                committed_ids = [int(token_id) for token_id in committed_segment.tolist()]
+                staged_first = posterior[acceptance_len : acceptance_len + 1]
+
+            # ── Shared: yield tokens, stop detection, profiling ──
             for token_id in committed_ids:
+                if token_id is None:
+                    continue
                 if len(generated_token_ids) >= max_new_tokens:
                     break
                 generated_token_ids.append(token_id)
@@ -1837,7 +2104,12 @@ def stream_dflash_generate(
             if stop_hit:
                 break
 
-            staged_first = posterior[acceptance_len : acceptance_len + 1]
+            if think_end_id is not None and not think_closed:
+                if think_end_id in committed_ids:
+                    think_closed = True
+                elif not think_forced and len(generated_token_ids) >= think_budget:
+                    staged_first = mx.array([think_end_id], dtype=mx.uint32)
+                    think_forced = True
 
             if profile_cycles:
                 cycle_total_ns = time.perf_counter_ns() - cycle_start_ns
@@ -1896,6 +2168,10 @@ def stream_dflash_generate(
             },
             "verify_len_cap": int(verify_len_cap),
         }
+        if _ddtree_active:
+            summary["ddtree_mode"] = ddtree_mode
+            summary["ddtree_cycles"] = _ddtree_cycles
+            summary["dflash_cycles"] = _dflash_cycles
         if profile_cycles:
             summary["cycle_profile_us"] = cycle_profiles
             summary["cycle_profile_totals_us"] = {

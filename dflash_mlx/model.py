@@ -102,12 +102,20 @@ class DFlashDraftModelArgs:
     rope_scaling: Optional[dict[str, Any]] = None
     layer_types: tuple[str, ...] = ()
     dflash_config: dict[str, Any] | None = None
+    markov_rank: int = 0
 
     @classmethod
     def from_dict(cls, params: dict[str, Any]) -> "DFlashDraftModelArgs":
         data = dict(params)
         data["layer_types"] = tuple(data.get("layer_types") or ())
         data["dflash_config"] = dict(data.get("dflash_config") or {})
+        # Newer drafter configs (DSpark) carry rope under transformers-5-style
+        # "rope_parameters" instead of top-level rope_theta/rope_scaling.
+        rope_parameters = data.get("rope_parameters")
+        if rope_parameters and data.get("rope_theta") is None:
+            data["rope_theta"] = rope_parameters.get("rope_theta", 10000.0)
+            if rope_parameters.get("rope_type", "default") != "default":
+                data["rope_scaling"] = rope_parameters
         return cls(
             **{key: value for key, value in data.items() if key in cls.__annotations__}
         )
@@ -279,6 +287,23 @@ class DFlashDecoderLayer(nn.Module):
         return residual + hidden_states
 
 
+class MarkovHead(nn.Module):
+    """DSpark's low-rank learned bigram bias over draft logits.
+
+    bias(prev_token) = markov_w2(markov_w1(prev_token)); added to the draft
+    logits at each block position, chained through the sampled tokens starting
+    from the anchor (bonus) token.
+    """
+
+    def __init__(self, vocab_size: int, markov_rank: int):
+        super().__init__()
+        self.markov_w1 = nn.Embedding(vocab_size, markov_rank)
+        self.markov_w2 = nn.Linear(markov_rank, vocab_size, bias=False)
+
+    def __call__(self, token_ids: mx.array) -> mx.array:
+        return self.markov_w2(self.markov_w1(token_ids))
+
+
 class DFlashDraftModel(nn.Module):
     def __init__(self, args: DFlashDraftModelArgs):
         super().__init__()
@@ -295,6 +320,17 @@ class DFlashDraftModel(nn.Module):
         self.hidden_norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.block_size = int(args.block_size)
         self.mask_token_id = int((args.dflash_config or {}).get("mask_token_id", 0) or 0)
+        # DSpark drafters (SpecForge/SGLang) use shifted next-token semantics:
+        # every block hidden (anchor included) predicts the token one position
+        # ahead, so a block of N inputs proposes N drafts, verified as
+        # [anchor] + drafts. z-lab DFlash drafters mask-fill in place instead.
+        self.projector_type = (args.dflash_config or {}).get("projector_type")
+        self.is_dspark = self.projector_type == "dspark"
+        markov_rank = int(args.markov_rank or 0)
+        if self.is_dspark and markov_rank > 0:
+            self.markov_head = MarkovHead(args.vocab_size, markov_rank)
+        else:
+            self.markov_head = None
 
     def _project_target_hidden(self, target_hidden: mx.array) -> mx.array:
         return self.hidden_norm(self.fc(target_hidden))
@@ -321,4 +357,15 @@ class DFlashDraftModel(nn.Module):
         return self.norm(hidden_states)
 
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
-        return weights
+        # The confidence head (adaptive block length) is not run; the Markov
+        # head is kept only when the model was constructed with one.
+        dropped_prefixes = (
+            ("confidence_head.",)
+            if self.markov_head is not None
+            else ("confidence_head.", "markov_head.")
+        )
+        return {
+            key: value
+            for key, value in weights.items()
+            if not key.startswith(dropped_prefixes)
+        }
