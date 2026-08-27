@@ -106,6 +106,23 @@ The cache can only help if the client resends a strict prefix. What matters, fro
 
 Thinking-block stripping by the client is fine — that's what the server-side normalization is for.
 
+## Models
+
+Draft models:
+
+| Draft | Type | For target family |
+|---|---|---|
+| [z-lab/Qwen3.5-27B-DFlash](https://huggingface.co/z-lab/Qwen3.5-27B-DFlash) | DFlash | Qwen3.5-27B (dense hybrid) |
+| [z-lab/Qwen3.5-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.5-35B-A3B-DFlash) | DFlash | Qwen3.5-35B-A3B (MoE) |
+| [RadixArk/Qwen3.8-27B-DSpark](https://huggingface.co/RadixArk/Qwen3.8-27B-DSpark) | DSpark | Qwen3.8-27B |
+
+Stock targets (see also [upstream's tested-models table](https://github.com/bstnxbt/dflash-mlx#tested-models)):
+[mlx-community/Qwen3.5-27B-4bit](https://huggingface.co/mlx-community/Qwen3.5-27B-4bit) ·
+[mlx-community/Qwen3.5-35B-A3B-4bit](https://huggingface.co/mlx-community/Qwen3.5-35B-A3B-4bit) ·
+[mlx-community/Qwen3.8-27B-4bit](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit)
+
+For full provenance, the benchmark tables above were measured on community variants: the 27B rows used [TheCluster/Qwen3.5-27B-Heretic-MLX-4bit](https://huggingface.co/TheCluster/Qwen3.5-27B-Heretic-MLX-4bit), and the 35B-A3B rows a locally-quantized 8-bit MLX build of [huihui-ai's finetune](https://huggingface.co/huihui-ai/Huihui-Qwen3.5-35B-A3B-abliterated). Architecture and quant determine the speed numbers; the stock models above should reproduce them.
+
 ## Reproducing the numbers
 
 `repro/` contains the harnesses behind the claims above, runnable against any dflash-serve instance (`DFLASH_BASE_URL` / `DFLASH_MODEL` env vars to point them elsewhere):
