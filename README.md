@@ -106,6 +106,24 @@ The cache can only help if the client resends a strict prefix. What matters, fro
 
 Thinking-block stripping by the client is fine — that's what the server-side normalization is for.
 
+## Reproducing the numbers
+
+`repro/` contains the harnesses behind the claims above, runnable against any dflash-serve instance (`DFLASH_BASE_URL` / `DFLASH_MODEL` env vars to point them elsewhere):
+
+```bash
+# Correctness: warm output must match cold output
+python repro/test_prefix_cache.py --phase warm     # seeds cache, saves turn-2 output
+# ...restart dflash-serve (drops the in-memory cache)...
+python repro/test_prefix_cache.py --phase cold     # same request from cold
+python repro/test_prefix_cache.py --phase compare  # expect EXACT MATCH
+
+# Cache smoke test + timing (single server, no restart)
+python repro/test_prefix_cache.py --phase smoke
+
+# Cold-vs-warm decode/prefill timing
+python repro/bench_decode.py --prompt-tokens 1000 --max-tokens 300 --n 3
+```
+
 ## autoresearch harness
 
 `autoresearch/` contains a pinned, seeded Spec-Bench harness (adapted from [karpathy/autoresearch](https://github.com/karpathy/autoresearch)) for measuring runtime changes: 10 balanced prompts, fixed budgets, `speedup` as the primary metric and token-match rate against the baseline greedy trajectory as the guard rail. Model and dataset locations are overridable via `AUTORESEARCH_TARGET_MODEL`, `AUTORESEARCH_DRAFT_MODEL`, and `AUTORESEARCH_SPECBENCH_QUESTIONS`.
