@@ -77,19 +77,44 @@ def _probe_thinking_tokens(tokenizer: Any) -> tuple[int, int]:
     return (open_id, close_id)
 
 
+def _probe_whitespace_tokens(tokenizer: Any) -> frozenset[int]:
+    """Find single-token-encoded whitespace strings. Used to eat trailing
+    whitespace after stripping a `<think>...</think>` span — without this,
+    a stored prompt can diverge from future turns where the client (opencode,
+    etc.) collapses post-thinking whitespace differently."""
+    result: set[int] = set()
+    for s in (
+        "\n", "\n\n", "\n\n\n", "\n\n\n\n",
+        " ", "  ", "   ", "    ",
+        "\t", "\r", " \n", "\n ", "\t\n", " \n\n",
+    ):
+        try:
+            ids = tokenizer.encode(s, add_special_tokens=False)
+            if len(ids) == 1:
+                result.add(int(ids[0]))
+        except Exception:
+            pass
+    return frozenset(result)
+
+
 def _strip_completed_thinking(
     tokens: list[int] | tuple[int, ...],
     open_id: int,
     close_id: int,
-    newline_id: int = 198,
+    whitespace_ids: frozenset[int] = frozenset({198}),
 ) -> list[int]:
-    """Remove every `[<think> ... </think>]` span (plus one trailing newline if
-    present). Leaves a dangling `<think>` with no matching close alone — that's
+    """Remove every `[<think> ... </think>]` span plus any trailing whitespace
+    tokens. Leaves a dangling `<think>` with no matching close alone — that's
     the generation-prompt suffix the model needs to see.
 
+    Eating ALL trailing whitespace (not just one `\\n`) after `</think>`
+    normalizes against clients that leave residual `\\n\\n` where our prior
+    snapshot didn't. Without this, stored and future tokens diverge at the
+    whitespace boundary and the strict prefix match fails.
+
     Nested `<think>` inside thinking is rare and treated as outer-first: the
-    first `</think>` after an open closes it; any further `<think>` before that
-    close is just content.
+    first `</think>` after an open closes it; any further `<think>` before
+    that close is just content.
     """
     if open_id < 0 or close_id < 0:
         return list(tokens)
@@ -108,7 +133,7 @@ def _strip_completed_thinking(
                 out.extend(tokens[i:])
                 break
             skip_end = j + 1
-            if skip_end < n and tokens[skip_end] == newline_id:
+            while skip_end < n and tokens[skip_end] in whitespace_ids:
                 skip_end += 1
             i = skip_end
         else:
@@ -293,15 +318,22 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
             # preserved — the model needs it to know it should start thinking.
             if not hasattr(self, "_dflash_thinking_tokens"):
                 self._dflash_thinking_tokens = _probe_thinking_tokens(tokenizer)
+                self._dflash_whitespace_tokens = _probe_whitespace_tokens(tokenizer)
                 sys.stderr.write(
                     f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] thinking tokens: "
-                    f"open={self._dflash_thinking_tokens[0]} close={self._dflash_thinking_tokens[1]}\n"
+                    f"open={self._dflash_thinking_tokens[0]} close={self._dflash_thinking_tokens[1]} "
+                    f"| whitespace ids: {sorted(self._dflash_whitespace_tokens)}\n"
                 )
                 sys.stderr.flush()
             _think_open, _think_close = self._dflash_thinking_tokens
             if _think_open >= 0 and _think_close >= 0:
                 _pre_len = len(prompt)
-                prompt = _strip_completed_thinking(prompt, _think_open, _think_close)
+                prompt = _strip_completed_thinking(
+                    prompt,
+                    _think_open,
+                    _think_close,
+                    whitespace_ids=self._dflash_whitespace_tokens,
+                )
                 _stripped = _pre_len - len(prompt)
                 if _stripped > 0:
                     sys.stderr.write(
