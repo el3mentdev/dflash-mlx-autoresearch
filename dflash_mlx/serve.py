@@ -42,6 +42,81 @@ from dflash_mlx.runtime import stream_dflash_generate
 _STATEFUL_SERVER_API = "state" in getattr(mlx_server.Response, "__annotations__", {})
 
 
+def _probe_thinking_tokens(tokenizer: Any) -> tuple[int, int]:
+    """Return (open_id, close_id) for `<think>` / `</think>`, or (-1, -1)
+    if the tokenizer doesn't expose them as single-token specials.
+
+    Qwen3-class models have these as added special tokens. We try
+    `convert_tokens_to_ids` first, then fall back to raw encode.
+    """
+    open_id = -1
+    close_id = -1
+    try:
+        for candidate, which in (("<think>", "open"), ("</think>", "close")):
+            tid = -1
+            if hasattr(tokenizer, "convert_tokens_to_ids"):
+                try:
+                    maybe = tokenizer.convert_tokens_to_ids(candidate)
+                    if isinstance(maybe, int) and maybe >= 0:
+                        tid = maybe
+                except Exception:
+                    pass
+            if tid < 0:
+                try:
+                    ids = tokenizer.encode(candidate, add_special_tokens=False)
+                    if len(ids) == 1:
+                        tid = int(ids[0])
+                except Exception:
+                    pass
+            if which == "open":
+                open_id = tid
+            else:
+                close_id = tid
+    except Exception:
+        pass
+    return (open_id, close_id)
+
+
+def _strip_completed_thinking(
+    tokens: list[int] | tuple[int, ...],
+    open_id: int,
+    close_id: int,
+    newline_id: int = 198,
+) -> list[int]:
+    """Remove every `[<think> ... </think>]` span (plus one trailing newline if
+    present). Leaves a dangling `<think>` with no matching close alone — that's
+    the generation-prompt suffix the model needs to see.
+
+    Nested `<think>` inside thinking is rare and treated as outer-first: the
+    first `</think>` after an open closes it; any further `<think>` before that
+    close is just content.
+    """
+    if open_id < 0 or close_id < 0:
+        return list(tokens)
+    out: list[int] = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        if tokens[i] == open_id:
+            # find the next close
+            j = i + 1
+            while j < n and tokens[j] != close_id:
+                j += 1
+            if j >= n:
+                # dangling open — keep from i onward untouched (this is the
+                # generation prompt tail).
+                out.extend(tokens[i:])
+                break
+            skip_end = j + 1
+            if skip_end < n and tokens[skip_end] == newline_id:
+                skip_end += 1
+            i = skip_end
+        else:
+            out.append(tokens[i])
+            i += 1
+    return out
+
+
 def _compute_gen_prompt_suffix(tokenizer: Any) -> tuple[int, ...]:
     """Return the token suffix that the chat template appends when
     add_generation_prompt=True compared to False (e.g., Qwen3.5 adds
@@ -211,6 +286,30 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                 prompt = tokenized
                 initial_state = "normal"
 
+            # Strip completed `<think>...</think>` spans from historical
+            # assistant turns so the cache is robust to opencode / agent
+            # frameworks that rewrite history between turns (removing prior
+            # thinking). Dangling `<think>` at the tail (generation prompt) is
+            # preserved — the model needs it to know it should start thinking.
+            if not hasattr(self, "_dflash_thinking_tokens"):
+                self._dflash_thinking_tokens = _probe_thinking_tokens(tokenizer)
+                sys.stderr.write(
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] thinking tokens: "
+                    f"open={self._dflash_thinking_tokens[0]} close={self._dflash_thinking_tokens[1]}\n"
+                )
+                sys.stderr.flush()
+            _think_open, _think_close = self._dflash_thinking_tokens
+            if _think_open >= 0 and _think_close >= 0:
+                _pre_len = len(prompt)
+                prompt = _strip_completed_thinking(prompt, _think_open, _think_close)
+                _stripped = _pre_len - len(prompt)
+                if _stripped > 0:
+                    sys.stderr.write(
+                        f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] stripped "
+                        f"{_stripped} thinking tokens ({_pre_len} -> {len(prompt)})\n"
+                    )
+                    sys.stderr.flush()
+
             sm = None
             sm_state = None
             sequences = {}
@@ -321,6 +420,53 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                     f"(commit_boundary={_commit_boundary})\n"
                 )
                 sys.stderr.flush()
+            else:
+                # MISS diagnostic: if any stored entry shares a non-trivial prefix,
+                # log where it diverges. This is how we detect prompt-body mutation
+                # by the client (opencode injecting dynamic system content, tool
+                # result reformatting, etc.) vs genuine cold requests.
+                _diag_best_lcp = 0
+                _diag_best_entry_tokens: Optional[tuple] = None
+                for _entry in self._dflash_prefix_cache:
+                    if _entry["model_key"] != _model_key:
+                        continue
+                    _et = _entry["tokens"]
+                    _lcp = 0
+                    for _a, _b in zip(_et, _prompt_tuple):
+                        if _a != _b:
+                            break
+                        _lcp += 1
+                    if _lcp > _diag_best_lcp:
+                        _diag_best_lcp = _lcp
+                        _diag_best_entry_tokens = _et
+                if (
+                    _diag_best_entry_tokens is not None
+                    and _diag_best_lcp > 0
+                    and _diag_best_lcp < len(_diag_best_entry_tokens)
+                ):
+                    _div = _diag_best_lcp
+                    _entry_len = len(_diag_best_entry_tokens)
+                    _win_lo = max(0, _div - 15)
+                    _win_hi_stored = min(_entry_len, _div + 15)
+                    _win_hi_prompt = min(len(_prompt_tuple), _div + 15)
+                    _stored_slice = list(_diag_best_entry_tokens[_win_lo:_win_hi_stored])
+                    _prompt_slice = list(_prompt_tuple[_win_lo:_win_hi_prompt])
+                    try:
+                        _stored_text = tokenizer.decode(_stored_slice)
+                        _prompt_text = tokenizer.decode(_prompt_slice)
+                    except Exception:
+                        _stored_text = "<decode-failed>"
+                        _prompt_text = "<decode-failed>"
+                    sys.stderr.write(
+                        f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] prefix cache MISS-DIAG | "
+                        f"best lcp={_div}/{_entry_len} (entry) "
+                        f"vs {len(_prompt_tuple)} (prompt) | diverge@{_div}\n"
+                        f"  stored[{_win_lo}:{_win_hi_stored}] = {_stored_slice!r}\n"
+                        f"  prompt[{_win_lo}:{_win_hi_prompt}] = {_prompt_slice!r}\n"
+                        f"  stored text: {_stored_text!r}\n"
+                        f"  prompt text: {_prompt_text!r}\n"
+                    )
+                    sys.stderr.flush()
             # Emit snapshot whenever phase 1 will do new committed work
             # (hit length < commit boundary). Skip when the cache already covers
             # exactly the committed prefix.
