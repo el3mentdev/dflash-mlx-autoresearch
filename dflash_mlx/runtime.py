@@ -1446,6 +1446,8 @@ def stream_dflash_generate(
     suppress_token_ids: Optional[list[int]] = None,
     prompt_tokens_override: Optional[list[int]] = None,
     quantize_kv_cache: bool = False,
+    cache_snapshot: Optional[dict[str, Any]] = None,
+    emit_cache_snapshot: bool = False,
 ) -> Iterator[dict[str, Any]]:
     if quantize_kv_cache:
         configure_full_attention_split(target_model, enabled=False)
@@ -1482,62 +1484,98 @@ def stream_dflash_generate(
         mx.array(stop_token_ids, dtype=mx.uint32) if stop_token_ids else None
     )
 
-    target_cache = make_target_cache(
-        target_model,
-        enable_speculative_linear_cache=True,
-        quantize_kv_cache=quantize_kv_cache,
-    )
-    draft_cache = [
-        ContextOnlyDraftKVCache(
-            sink_size=draft_sink_size,
-            window_size=draft_window_size,
-        )
-        for _ in range(len(draft_model.layers))
-    ]
     capture_layer_ids = {int(layer_id) + 1 for layer_id in draft_model.target_layer_ids}
 
     try:
         start_ns = time.perf_counter_ns()
         prefill_start_ns = time.perf_counter_ns()
-        prefill_step_size = 2048
-        prefill_logits = None
-        target_hidden_chunks: list[mx.array] = []
-        for chunk_start in range(0, prompt_len, prefill_step_size):
-            chunk_end = min(chunk_start + prefill_step_size, prompt_len)
-            chunk_ids = prompt_array[:, chunk_start:chunk_end]
-            prefill_logits, prefill_hidden_states = target_forward_with_hidden_states(
-                target_model,
-                input_ids=chunk_ids,
-                cache=target_cache,
-                capture_layer_ids=capture_layer_ids,
-            )
-            _eval_logits_and_captured(prefill_logits, prefill_hidden_states)
-            target_hidden_chunks.append(
-                extract_context_feature_from_dict(
-                    prefill_hidden_states,
-                    list(draft_model.target_layer_ids),
-                )
-            )
+
+        # Fast path: exact-prefix cache hit — skip the whole target prefill.
+        # The server is responsible for deep-copying the snapshot before passing it.
+        if (
+            cache_snapshot is not None
+            and cache_snapshot.get("prompt_len") == prompt_len
+        ):
+            target_cache = cache_snapshot["target_cache"]
+            target_hidden = cache_snapshot["target_hidden"]
+            staged_first = cache_snapshot["staged_first"]
+            suppress_token_mask = cache_snapshot["suppress_token_mask"]
+            draft_cache = cache_snapshot["draft_cache"]
+            prefill_ns = int(cache_snapshot.get("prefill_ns", 0))
             yield {
-                "event": "prefill_progress",
-                "tokens_processed": chunk_end,
-                "tokens_total": prompt_len,
+                "event": "prefill",
+                "prefill_us": prefill_ns / 1_000.0,
+                "prompt_token_count": prompt_len,
+                "cached_prefill": True,
             }
-        prefill_ns = time.perf_counter_ns() - prefill_start_ns
+        else:
+            target_cache = make_target_cache(
+                target_model,
+                enable_speculative_linear_cache=True,
+                quantize_kv_cache=quantize_kv_cache,
+            )
+            draft_cache = [
+                ContextOnlyDraftKVCache(
+                    sink_size=draft_sink_size,
+                    window_size=draft_window_size,
+                )
+                for _ in range(len(draft_model.layers))
+            ]
+            prefill_step_size = 2048
+            prefill_logits = None
+            target_hidden_chunks: list[mx.array] = []
+            for chunk_start in range(0, prompt_len, prefill_step_size):
+                chunk_end = min(chunk_start + prefill_step_size, prompt_len)
+                chunk_ids = prompt_array[:, chunk_start:chunk_end]
+                prefill_logits, prefill_hidden_states = target_forward_with_hidden_states(
+                    target_model,
+                    input_ids=chunk_ids,
+                    cache=target_cache,
+                    capture_layer_ids=capture_layer_ids,
+                )
+                _eval_logits_and_captured(prefill_logits, prefill_hidden_states)
+                target_hidden_chunks.append(
+                    extract_context_feature_from_dict(
+                        prefill_hidden_states,
+                        list(draft_model.target_layer_ids),
+                    )
+                )
+                yield {
+                    "event": "prefill_progress",
+                    "tokens_processed": chunk_end,
+                    "tokens_total": prompt_len,
+                }
+            prefill_ns = time.perf_counter_ns() - prefill_start_ns
 
-        suppress_token_mask = build_suppress_token_mask(int(prefill_logits.shape[-1]), suppress_token_ids)
-        staged_first = greedy_tokens_with_mask(prefill_logits[:, -1, :], suppress_token_mask).reshape(-1)
-        target_hidden = (
-            target_hidden_chunks[0]
-            if len(target_hidden_chunks) == 1
-            else mx.concatenate(target_hidden_chunks, axis=1)
-        )
+            suppress_token_mask = build_suppress_token_mask(int(prefill_logits.shape[-1]), suppress_token_ids)
+            staged_first = greedy_tokens_with_mask(prefill_logits[:, -1, :], suppress_token_mask).reshape(-1)
+            target_hidden = (
+                target_hidden_chunks[0]
+                if len(target_hidden_chunks) == 1
+                else mx.concatenate(target_hidden_chunks, axis=1)
+            )
 
-        yield {
-            "event": "prefill",
-            "prefill_us": prefill_ns / 1_000.0,
-            "prompt_token_count": prompt_len,
-        }
+            yield {
+                "event": "prefill",
+                "prefill_us": prefill_ns / 1_000.0,
+                "prompt_token_count": prompt_len,
+                "cached_prefill": False,
+            }
+
+            # Emit snapshot so the server can deep-copy and store for reuse.
+            # This must happen BEFORE the generation loop starts mutating
+            # target_cache / draft_cache. The server must deepcopy immediately.
+            if emit_cache_snapshot:
+                yield {
+                    "event": "cache_snapshot",
+                    "target_cache": target_cache,
+                    "target_hidden": target_hidden,
+                    "staged_first": staged_first,
+                    "suppress_token_mask": suppress_token_mask,
+                    "draft_cache": draft_cache,
+                    "prefill_ns": int(prefill_ns),
+                    "prompt_len": prompt_len,
+                }
 
         draft_block_size = int(draft_model.block_size)
         requested_block_tokens = draft_block_size if block_tokens is None else int(block_tokens)
