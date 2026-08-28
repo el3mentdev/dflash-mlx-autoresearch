@@ -154,7 +154,7 @@ python repro/bench_decode.py --prompt-tokens 1000 --max-tokens 300 --n 3
 
 ## Relationship to upstream
 
-Built on [bstnxbt/dflash-mlx](https://github.com/bstnxbt/dflash-mlx) v0.1.3, which implements the DFlash runtime (tape-replay rollback, JIT SDPA 2-pass verify, custom Metal kernels) for MLX. The exact-prefix cache fix is general-purpose and a candidate for upstreaming; the thinking-strip and commit-boundary layers are opinionated toward agent workloads and live here.
+Built on [bstnxbt/dflash-mlx](https://github.com/bstnxbt/dflash-mlx) v0.1.3, which implements the DFlash runtime (tape-replay rollback, JIT SDPA 2-pass verify, custom Metal kernels) for MLX. Upstream has since (≥ v0.1.10) shipped its own prefix-cache subsystem covering exact-prefix KV snapshots on hybrid targets and ChatML/Gemma commit-boundary snapshotting — independently converging on the same design this fork prototyped. What upstream still lacks, and what remains this fork's distinct contribution, is the cache-key normalization layer for agent clients: server-side thinking-block stripping and whitespace canonicalization (being proposed upstream separately).
 
 DFlash itself is the work of [z-lab](https://github.com/z-lab/dflash) — paper: [DFlash: Block Diffusion for Flash Speculative Decoding](https://arxiv.org/abs/2602.06036) (Chen et al., 2026) — including the draft models used here. DSpark drafters by [RadixArk](https://huggingface.co/RadixArk).
 
